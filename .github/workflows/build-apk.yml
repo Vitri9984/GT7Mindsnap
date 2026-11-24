@@ -340,7 +340,13 @@ jobs:
                           }
                       }
                       root.addView(zoneBtn)
+               }
+           }
+       """), encoding="utf-8")
 
+       print("Upgraded project to v1.2 in", root)
+       PYEOF
+       
                       modeBtn = Button(this).apply {
                           setOnClickListener {
                               val cur = prefs.getString("mode", "MIND_SPACE")
