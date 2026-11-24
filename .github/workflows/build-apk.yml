@@ -1,48 +1,113 @@
-name: Build Mind Snap Bridge APK
+name: Build GT7 MindSnap Bridge APK
 
 on:
+  workflow_dispatch:
   push:
     branches: [ main ]
-  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  build:
+  build-apk:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Java
+      - name: Extract and repair Android project
+        shell: bash
+        run: |
+          set -euo pipefail
+          SETTINGS_FILE=$(find . -maxdepth 4 \( -name "settings.gradle.kts" -o -name "settings.gradle" \) | head -n 1 || true)
+          if [ -z "$SETTINGS_FILE" ]; then
+            ZIP_FILE=$(find . -maxdepth 2 -name "*.zip" | head -n 1 || true)
+            if [ -z "$ZIP_FILE" ]; then
+              echo "::error::No Android project or source ZIP found in repo"
+              exit 1
+            fi
+            echo "Extracting $ZIP_FILE"
+            unzip -q -o "$ZIP_FILE" -d extracted_project
+            SETTINGS_FILE=$(find extracted_project -maxdepth 4 \( -name "settings.gradle.kts" -o -name "settings.gradle" \) | head -n 1)
+          fi
+          PROJECT_DIR=$(dirname "$SETTINGS_FILE")
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+          python3 - "$PROJECT_DIR" << 'PYEOF'
+          import sys
+          from pathlib import Path
+
+          root = Path(sys.argv[1])
+
+          acc = root / "app/src/main/res/xml/mind_snap_accessibility.xml"
+          if acc.exists():
+              txt = acc.read_text(encoding="utf-8")
+              if 'canTakeScreenshot' not in txt:
+                  txt = txt.replace('android:canPerformGestures="false"', 'android:canPerformGestures="false"\n    android:canTakeScreenshot="true"\n    android:settingsActivity="com.mindsnap.gt7.MainActivity"')
+                  acc.write_text(txt, encoding="utf-8")
+
+          svc = root / "app/src/main/java/com/mindsnap/gt7/MindSnapAccessibilityService.kt"
+          if svc.exists():
+              txt = svc.read_text(encoding="utf-8")
+              txt = txt.replace("import android.hardware.display.DisplayManager", "import android.view.Display")
+              txt = txt.replace("import android.media.Image\n", "")
+              txt = txt.replace("DisplayManager.DEFAULT_DISPLAY", "Display.DEFAULT_DISPLAY")
+              txt = txt.replace("(42 * resources.displayMetrics.density).toInt(), (150 * resources.displayMetrics.density).toInt()", "(64 * resources.displayMetrics.density).toInt(), (210 * resources.displayMetrics.density).toInt()")
+              svc.write_text(txt, encoding="utf-8")
+
+          print("Applied manifest and Kotlin fixes in", root)
+          PYEOF
+
+      - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Gradle
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android API 35
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Set up Gradle 8.11.1
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.11.1'
 
-      - name: Extract Android project
+      - name: Build debug APK
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}
         run: |
-          mkdir extracted
-          unzip -q MindSnapBridge_GitHub_Source.zip -d extracted
-          PROJECT_DIR=$(dirname "$(find extracted -name settings.gradle.kts -print -quit)")
-          echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
+          set -o pipefail
+          gradle --no-daemon --stacktrace assembleDebug 2>&1 | tee build.log
 
-      - name: Build APK
+      - name: Package and verify MindSnapBridge-GT7.apk
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}
         run: |
-          cd "$PROJECT_DIR"
-          gradle --no-daemon clean assembleDebug
-          cp app/build/outputs/apk/debug/app-debug.apk "$GITHUB_WORKSPACE/MindSnapBridge-GT7.apk"
+          set -euo pipefail
+          mkdir -p dist
+          cp app/build/outputs/apk/debug/app-debug.apk dist/MindSnapBridge-GT7.apk
+          ls -lh dist/MindSnapBridge-GT7.apk
+          "$ANDROID_HOME/build-tools/35.0.0/aapt2" dump badging dist/MindSnapBridge-GT7.apk | head -n 10
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --print-certs dist/MindSnapBridge-GT7.apk
 
-      - name: Upload APK
+      - name: Upload MindSnapBridge-GT7.apk
         uses: actions/upload-artifact@v4
         with:
-          name: MindSnapBridge-GT7-APK
-          path: MindSnapBridge-GT7.apk
+          name: MindSnapBridge-GT7-apk
+          path: ${{ env.PROJECT_DIR }}/dist/MindSnapBridge-GT7.apk
+          if-no-files-found: error
           retention-days: 30
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: MindSnapBridge-GT7-build-log
+          path: ${{ env.PROJECT_DIR }}/build.log
+          if-no-files-found: ignore
