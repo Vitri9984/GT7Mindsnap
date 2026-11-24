@@ -15,7 +15,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Extract and repair Android project
+      - name: Extract and upgrade Android project to v1.2
         shell: bash
         run: |
           set -euo pipefail
@@ -26,7 +26,6 @@ jobs:
               echo "::error::No Android project or source ZIP found in repo"
               exit 1
             fi
-            echo "Extracting $ZIP_FILE"
             unzip -q -o "$ZIP_FILE" -d extracted_project
             SETTINGS_FILE=$(find extracted_project -maxdepth 4 \( -name "settings.gradle.kts" -o -name "settings.gradle" \) | head -n 1)
           fi
@@ -34,93 +33,346 @@ jobs:
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
 
           python3 - "$PROJECT_DIR" << 'PYEOF'
-          import re, sys
+          import sys, textwrap
           from pathlib import Path
 
           root = Path(sys.argv[1])
 
           strings_file = root / "app/src/main/res/values/strings.xml"
           strings_file.parent.mkdir(parents=True, exist_ok=True)
-          if not strings_file.exists():
-              strings_file.write_text(
-                  '<?xml version="1.0" encoding="utf-8"?>\n'
-                  '<resources>\n'
-                  '    <string name="app_name">GT7 MindSnap Bridge</string>\n'
-                  '    <string name="accessibility_service_description">Capture the screen when you use the Mind Snap gesture or Quick Settings tile.</string>\n'
-                  '</resources>\n',
-                  encoding="utf-8"
-              )
+          strings_file.write_text(textwrap.dedent("""\
+              <?xml version="1.0" encoding="utf-8"?>
+              <resources>
+                  <string name="app_name">GT7 MindSnap Bridge</string>
+                  <string name="accessibility_service_description">Captures the screen when you swipe up on the edge handle or tap the Quick Settings tile.</string>
+              </resources>
+          """), encoding="utf-8")
 
           acc = root / "app/src/main/res/xml/mind_snap_accessibility.xml"
-          if acc.exists():
-              txt = acc.read_text(encoding="utf-8")
-              txt = re.sub(r'android:description="[^"]*"', 'android:description="@string/accessibility_service_description"', txt)
-              if 'canTakeScreenshot' not in txt:
-                  txt = txt.replace('android:canPerformGestures="false"', 'android:canPerformGestures="false"\n    android:canTakeScreenshot="true"\n    android:settingsActivity="com.mindsnap.gt7.MainActivity"')
-              acc.write_text(txt, encoding="utf-8")
+          acc.write_text(textwrap.dedent("""\
+              <?xml version="1.0" encoding="utf-8"?>
+              <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+                  android:accessibilityEventTypes="typeWindowStateChanged"
+                  android:accessibilityFeedbackType="feedbackGeneric"
+                  android:accessibilityFlags="flagDefault"
+                  android:canPerformGestures="false"
+                  android:canRetrieveWindowContent="false"
+                  android:canTakeScreenshot="true"
+                  android:description="@string/accessibility_service_description"
+                  android:notificationTimeout="100"
+                  android:settingsActivity="com.mindsnap.gt7.MainActivity" />
+          """), encoding="utf-8")
 
           svc = root / "app/src/main/java/com/mindsnap/gt7/MindSnapAccessibilityService.kt"
-          if svc.exists():
-              txt = svc.read_text(encoding="utf-8")
-              txt = txt.replace("import android.hardware.display.DisplayManager", "import android.view.Display")
-              txt = txt.replace("import android.media.Image\n", "")
-              txt = txt.replace("DisplayManager.DEFAULT_DISPLAY", "Display.DEFAULT_DISPLAY")
-              txt = txt.replace("(42 * resources.displayMetrics.density).toInt(), (150 * resources.displayMetrics.density).toInt()", "(64 * resources.displayMetrics.density).toInt(), (210 * resources.displayMetrics.density).toInt()")
-              svc.write_text(txt, encoding="utf-8")
+          svc.write_text(textwrap.dedent("""\
+              package com.mindsnap.gt7
 
-          print("Applied manifest, resource, and Kotlin fixes in", root)
-          PYEOF
+              import android.accessibilityservice.AccessibilityService
+              import android.content.ClipData
+              import android.content.ContentValues
+              import android.content.Intent
+              import android.graphics.Bitmap
+              import android.graphics.Color
+              import android.graphics.PixelFormat
+              import android.graphics.drawable.GradientDrawable
+              import android.net.Uri
+              import android.os.Build
+              import android.os.Handler
+              import android.os.Looper
+              import android.provider.MediaStore
+              import android.view.Display
+              import android.view.Gravity
+              import android.view.HapticFeedbackConstants
+              import android.view.MotionEvent
+              import android.view.View
+              import android.view.WindowManager
+              import android.view.accessibility.AccessibilityEvent
+              import android.widget.TextView
+              import android.widget.Toast
+              import java.util.concurrent.Executors
+              import java.util.concurrent.atomic.AtomicBoolean
+              import kotlin.math.abs
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
+              class MindSnapAccessibilityService : AccessibilityService() {
+                  private var wm: WindowManager? = null
+                  private var zone: View? = null
+                  private val handler = Handler(Looper.getMainLooper())
+                  private val io = Executors.newSingleThreadExecutor()
+                  private val busy = AtomicBoolean(false)
+                  private var startX = 0f
+                  private var startY = 0f
+                  private var triggered = false
+                  private var lastTriggerMs = 0L
 
-      - name: Install Android API 35 platform and build-tools
-        shell: bash
-        run: |
-          set -euo pipefail
-          SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" -name sdkmanager | head -n 1)
-          echo "Using sdkmanager: $SDKMANAGER"
-          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
-          "$SDKMANAGER" "platforms;android-35" "build-tools;35.0.0"
+                  companion object {
+                      @Volatile var instance: MindSnapAccessibilityService? = null
+                  }
 
-      - name: Set up Gradle 8.11.1
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.11.1'
+                  override fun onServiceConnected() {
+                      super.onServiceConnected()
+                      instance = this
+                      wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                      refreshOverlay()
+                  }
 
-      - name: Build debug APK
-        shell: bash
-        working-directory: ${{ env.PROJECT_DIR }}
-        run: |
-          set -o pipefail
-          gradle --no-daemon --stacktrace assembleDebug 2>&1 | tee build.log
+                  override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+                  override fun onInterrupt() {}
 
-      - name: Package and verify MindSnapBridge-GT7.apk
-        shell: bash
-        working-directory: ${{ env.PROJECT_DIR }}
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          cp app/build/outputs/apk/debug/app-debug.apk dist/MindSnapBridge-GT7.apk
-          ls -lh dist/MindSnapBridge-GT7.apk
-          "$ANDROID_HOME/build-tools/35.0.0/aapt2" dump badging dist/MindSnapBridge-GT7.apk | head -n 10
-          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --print-certs dist/MindSnapBridge-GT7.apk
+                  override fun onDestroy() {
+                      removeZone()
+                      io.shutdownNow()
+                      instance = null
+                      super.onDestroy()
+                  }
 
-      - name: Upload MindSnapBridge-GT7.apk
-        uses: actions/upload-artifact@v4
-        with:
-          name: MindSnapBridge-GT7-apk
-          path: ${{ env.PROJECT_DIR }}/dist/MindSnapBridge-GT7.apk
-          if-no-files-found: error
-          retention-days: 30
+                  fun refreshOverlay() {
+                      handler.post {
+                          removeZone()
+                          val prefs = getSharedPreferences("bridge", MODE_PRIVATE)
+                          if (!prefs.getBoolean("zone", false)) return@post
+                          val d = resources.displayMetrics.density
+                          val v = TextView(this).apply {
+                              text = "SNAP\\n鈫�"
+                              textSize = 11f
+                              gravity = Gravity.CENTER
+                              setTextColor(Color.WHITE)
+                              background = GradientDrawable().apply {
+                                  setColor(0x88FFC915.toInt())
+                                  cornerRadius = 18f * d
+                                  setStroke((1.5f * d).toInt().coerceAtLeast(2), 0xFFFFD640.toInt())
+                              }
+                              setOnTouchListener { view, e ->
+                                  when (e.actionMasked) {
+                                      MotionEvent.ACTION_DOWN -> {
+                                          startX = e.rawX
+                                          startY = e.rawY
+                                          triggered = false
+                                      }
+                                      MotionEvent.ACTION_MOVE -> {
+                                          val dy = startY - e.rawY
+                                          val dx = abs(e.rawX - startX)
+                                          val now = System.currentTimeMillis()
+                                          if (!triggered && now - lastTriggerMs > 1500L && dy > 65f * d && dy > dx * 1.2f) {
+                                              triggered = true
+                                              lastTriggerMs = now
+                                              view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                                              captureAndShare(140L)
+                                          }
+                                      }
+                                      MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                                          triggered = false
+                                      }
+                                  }
+                                  true
+                              }
+                          }
+                          val params = WindowManager.LayoutParams(
+                              (52 * d).toInt(),
+                              (190 * d).toInt(),
+                              WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                              WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                                  WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                                  WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                              PixelFormat.TRANSLUCENT
+                          ).apply {
+                              gravity = Gravity.END or Gravity.CENTER_VERTICAL
+                          }
+                          try {
+                              wm?.addView(v, params)
+                              zone = v
+                          } catch (_: Exception) {}
+                      }
+                  }
 
-      - name: Upload build log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: MindSnapBridge-GT7-build-log
-          path: ${{ env.PROJECT_DIR }}/build.log
-          if-no-files-found: ignore
+                  private fun removeZone() {
+                      try { zone?.let { wm?.removeView(it) } } catch (_: Exception) {}
+                      zone = null
+                  }
+
+                  fun captureAndShare(delayMs: Long = 140L) {
+                      if (Build.VERSION.SDK_INT < 30) return
+                      if (!busy.compareAndSet(false, true)) return
+                      handler.post {
+                          val wasVisible = zone?.visibility == View.VISIBLE
+                          zone?.visibility = View.INVISIBLE
+                          handler.postDelayed({
+                              takeScreenshot(Display.DEFAULT_DISPLAY, mainExecutor, object : TakeScreenshotCallback {
+                                  override fun onSuccess(result: ScreenshotResult) {
+                                      if (wasVisible) zone?.visibility = View.VISIBLE
+                                      val hb = result.hardwareBuffer
+                                      val cs = result.colorSpace
+                                      io.execute {
+                                          var hwBmp: Bitmap? = null
+                                          var swBmp: Bitmap? = null
+                                          try {
+                                              hwBmp = Bitmap.wrapHardwareBuffer(hb, cs)
+                                              if (hwBmp == null) {
+                                                  toast("Capture failed: empty buffer")
+                                                  return@execute
+                                              }
+                                              swBmp = hwBmp.copy(Bitmap.Config.ARGB_8888, false)
+                                              hwBmp.recycle(); hwBmp = null
+                                              val values = ContentValues().apply {
+                                                  put(MediaStore.Images.Media.DISPLAY_NAME, "MindSnap_${System.currentTimeMillis()}.png")
+                                                  put(MediaStore.Images.Media.MIME_TYPE, "image/png")
+                                                  put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/MindSnapBridge")
+                                                  put(MediaStore.Images.Media.IS_PENDING, 1)
+                                              }
+                                              val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+                                              if (uri != null) {
+                                                  contentResolver.openOutputStream(uri)?.use { out ->
+                                                      swBmp?.compress(Bitmap.CompressFormat.PNG, 100, out)
+                                                      out.flush()
+                                                  }
+                                                  val done = ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) }
+                                                  contentResolver.update(uri, done, null, null)
+                                                  handler.post { afterSave(uri) }
+                                              } else {
+                                                  toast("Could not save screenshot")
+                                              }
+                                          } catch (e: Exception) {
+                                              toast("Capture error: ${e.localizedMessage ?: "unknown"}")
+                                          } finally {
+                                              try { hwBmp?.recycle() } catch (_: Exception) {}
+                                              try { swBmp?.recycle() } catch (_: Exception) {}
+                                              try { hb.close() } catch (_: Exception) {}
+                                              busy.set(false)
+                                          }
+                                      }
+                                  }
+
+                                  override fun onFailure(errorCode: Int) {
+                                      if (wasVisible) zone?.visibility = View.VISIBLE
+                                      busy.set(false)
+                                      val msg = when (errorCode) {
+                                          ERROR_TAKE_SCREENSHOT_NO_ACCESSIBILITY_ACCESS -> "Re-enable Accessibility service"
+                                          ERROR_TAKE_SCREENSHOT_INTERVAL_TIME_SHORT -> "Wait 1s between captures"
+                                          6 -> "Protected (FLAG_SECURE) screen"
+                                          else -> "Screenshot failed (code $errorCode)"
+                                      }
+                                      toast(msg)
+                                  }
+                              })
+                          }, delayMs)
+                      }
+                  }
+
+                  private fun afterSave(uri: Uri) {
+                      val mode = getSharedPreferences("bridge", MODE_PRIVATE).getString("mode", "MIND_SPACE")
+                      if (mode == "SHARESHEET") {
+                          val send = Intent(Intent.ACTION_SEND).apply {
+                              type = "image/png"
+                              putExtra(Intent.EXTRA_STREAM, uri)
+                              clipData = ClipData.newUri(contentResolver, "Mind Snap", uri)
+                              addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                          }
+                          startActivity(Intent.createChooser(send, "Share Mind Snap").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                      } else {
+                          toast("Saved to Pictures/MindSnapBridge 鈥� opening Mind Space")
+                          val launch = packageManager.getLaunchIntentForPackage("com.oplus.aimemory")
+                          if (launch != null) {
+                              launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                              startActivity(launch)
+                          } else {
+                              toast("Mind Space not installed")
+                          }
+                      }
+                  }
+
+                  private fun toast(msg: String) {
+                      handler.post { Toast.makeText(this, msg, Toast.LENGTH_SHORT).show() }
+                  }
+              }
+          """), encoding="utf-8")
+
+          main = root / "app/src/main/java/com/mindsnap/gt7/MainActivity.kt"
+          main.write_text(textwrap.dedent("""\
+              package com.mindsnap.gt7
+
+              import android.app.Activity
+              import android.content.Intent
+              import android.graphics.Color
+              import android.os.Bundle
+              import android.provider.Settings
+              import android.widget.Button
+              import android.widget.LinearLayout
+              import android.widget.ScrollView
+              import android.widget.TextView
+              import android.widget.Toast
+
+              class MainActivity : Activity() {
+                  private lateinit var statusTv: TextView
+                  private lateinit var zoneBtn: Button
+                  private lateinit var modeBtn: Button
+
+                  override fun onCreate(savedInstanceState: Bundle?) {
+                      super.onCreate(savedInstanceState)
+                      val prefs = getSharedPreferences("bridge", MODE_PRIVATE)
+                      val scroll = ScrollView(this).apply { setBackgroundColor(Color.parseColor("#0F1115")) }
+                      val root = LinearLayout(this).apply {
+                          orientation = LinearLayout.VERTICAL
+                          setPadding(40, 56, 40, 56)
+                      }
+
+                      root.addView(TextView(this).apply {
+                          text = "GT7 MindSnap Bridge v1.2"
+                          textSize = 22f
+                          setTextColor(Color.parseColor("#FFC915"))
+                      })
+                      statusTv = TextView(this).apply {
+                          textSize = 14f
+                          setTextColor(Color.WHITE)
+                          setPadding(0, 16, 0, 24)
+                      }
+                      root.addView(statusTv)
+
+                      root.addView(Button(this).apply {
+                          text = "1. Open Accessibility Settings"
+                          setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                      })
+
+                      zoneBtn = Button(this).apply {
+                          setOnClickListener {
+                              val next = !prefs.getBoolean("zone", false)
+                              prefs.edit().putBoolean("zone", next).apply()
+                              MindSnapAccessibilityService.instance?.refreshOverlay()
+                              updateUi()
+                          }
+                      }
+                      root.addView(zoneBtn)
+
+                      modeBtn = Button(this).apply {
+                          setOnClickListener {
+                              val cur = prefs.getString("mode", "MIND_SPACE")
+                              val next = if (cur == "MIND_SPACE") "SHARESHEET" else "MIND_SPACE"
+                              prefs.edit().putString("mode", next).apply()
+                              updateUi()
+                          }
+                      }
+                      root.addView(modeBtn)
+
+                      root.addView(Button(this).apply {
+                          text = "Capture Screen in 3 Seconds"
+                          setOnClickListener {
+                              val svc = MindSnapAccessibilityService.instance
+                              if (svc == null) {
+                                  Toast.makeText(this@MainActivity, "Enable Accessibility service first", Toast.LENGTH_SHORT).show()
+                              } else {
+                                  Toast.makeText(this@MainActivity, "Switch screen 鈥� capturing in 3s", Toast.LENGTH_SHORT).show()
+                                  moveTaskToBack(true)
+                                  svc.captureAndShare(3000L)
+                              }
+                          }
+                      })
+
+                      root.addView(Button(this).apply {
+                          text = "Open Mind Space"
+                          setOnClickListener {
+                              val i = packageManager.getLaunchIntentForPackage("com.oplus.aimemory")
+                              if (i != null) startActivity(i)
+                              else Toast.makeText(this@MainActivity, "Mind Space not found", Toast.LENGTH_SHORT).show()
+                          }
+                      })
+
+                      root.addView(TextView(this).apply {
+                          text = "\\nHow to use:\\n鈥� Swipe UP with 1 finger on the gold SNAP 鈫� edge bar (avoids Realme UI 3-finger Split View).\\n鈥� Screenshots save to Pictures/MindSnapBridge and open Mind Space.\\n鈥� Note: Mind Space 17.3.301 
