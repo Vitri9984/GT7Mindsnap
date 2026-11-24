@@ -34,17 +34,30 @@ jobs:
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
 
           python3 - "$PROJECT_DIR" << 'PYEOF'
-          import sys
+          import re, sys
           from pathlib import Path
 
           root = Path(sys.argv[1])
 
+          strings_file = root / "app/src/main/res/values/strings.xml"
+          strings_file.parent.mkdir(parents=True, exist_ok=True)
+          if not strings_file.exists():
+              strings_file.write_text(
+                  '<?xml version="1.0" encoding="utf-8"?>\n'
+                  '<resources>\n'
+                  '    <string name="app_name">GT7 MindSnap Bridge</string>\n'
+                  '    <string name="accessibility_service_description">Capture the screen when you use the Mind Snap gesture or Quick Settings tile.</string>\n'
+                  '</resources>\n',
+                  encoding="utf-8"
+              )
+
           acc = root / "app/src/main/res/xml/mind_snap_accessibility.xml"
           if acc.exists():
               txt = acc.read_text(encoding="utf-8")
+              txt = re.sub(r'android:description="[^"]*"', 'android:description="@string/accessibility_service_description"', txt)
               if 'canTakeScreenshot' not in txt:
                   txt = txt.replace('android:canPerformGestures="false"', 'android:canPerformGestures="false"\n    android:canTakeScreenshot="true"\n    android:settingsActivity="com.mindsnap.gt7.MainActivity"')
-                  acc.write_text(txt, encoding="utf-8")
+              acc.write_text(txt, encoding="utf-8")
 
           svc = root / "app/src/main/java/com/mindsnap/gt7/MindSnapAccessibilityService.kt"
           if svc.exists():
@@ -55,7 +68,7 @@ jobs:
               txt = txt.replace("(42 * resources.displayMetrics.density).toInt(), (150 * resources.displayMetrics.density).toInt()", "(64 * resources.displayMetrics.density).toInt(), (210 * resources.displayMetrics.density).toInt()")
               svc.write_text(txt, encoding="utf-8")
 
-          print("Applied manifest and Kotlin fixes in", root)
+          print("Applied manifest, resource, and Kotlin fixes in", root)
           PYEOF
 
       - name: Set up JDK 17
@@ -67,12 +80,11 @@ jobs:
       - name: Install Android API 35 platform and build-tools
         shell: bash
         run: |
-         set -euo pipefail
-         SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" -name sdkmanager | head -n 1)
-         echo "Using sdkmanager: $SDKMANAGER"
-         yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          set -euo pipefail
+          SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" -name sdkmanager | head -n 1)
+          echo "Using sdkmanager: $SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
           "$SDKMANAGER" "platforms;android-35" "build-tools;35.0.0"
-            
 
       - name: Set up Gradle 8.11.1
         uses: gradle/actions/setup-gradle@v4
